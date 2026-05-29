@@ -1,0 +1,13 @@
+{
+  "name": "chess-multiplayer-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WebSocket server for human-vs-human chess multiplayer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
