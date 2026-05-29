@@ -3341,7 +3341,9 @@ let _rematchOfferSettings  = null;    // {timeSec, incSec, offererColor}
 let _originalGameSettings  = null;    // {timeSec, incSec} captured at first start (Same Settings reuse)
 let _seriesScore           = null;    // { yours, theirs, draws } once ≥2 games played, else null
 let _suppressLocalGameOver = false;   // when true, executeMove's terminal-detection won't auto-show the gameover modal (server's gameOver does it)
-const HUMAN_WS_URL         = 'ws://localhost:8080';
+const HUMAN_WS_URL         = (location.hostname === 'localhost' || location.hostname === '127.0.0.1' || location.protocol === 'file:')
+  ? 'ws://localhost:8080'
+  : 'wss://chess-multiplayer-gjuv.onrender.com';
 
 // Render the starting position immediately so the board is visible
 // behind the color-picker overlay on first load.
