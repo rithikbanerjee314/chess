@@ -40,6 +40,221 @@ function resolveColor(choice) {
   return Math.random() < 0.5 ? 'w' : 'b';
 }
 
+// ─── Chess engine (move legality) ──────────────────────────────────────────
+// Ported verbatim from chess.html's pure engine functions so the server can
+// independently verify that each submitted move is actually legal, instead
+// of trusting the client. Keep in sync with chess.html if the engine changes.
+
+const INIT_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+
+function algebraicToIndex(alg) {
+  const file = alg.charCodeAt(0) - 97;
+  const rank = +alg[1] - 1;
+  return rank * 8 + file;
+}
+
+function parseFen(fen) {
+  const parts = fen.split(' ');
+  const board = new Array(64).fill(null);
+  let rank = 7, file = 0;
+  for (const ch of parts[0]) {
+    if (ch === '/') { rank--; file = 0; }
+    else if (ch >= '1' && ch <= '8') { file += +ch; }
+    else { board[rank * 8 + file] = ch; file++; }
+  }
+  return {
+    board,
+    turn: parts[1] === 'w' ? 'w' : 'b',
+    castling: parts[2],
+    enPassant: parts[3] === '-' ? null : algebraicToIndex(parts[3]),
+  };
+}
+
+function pieceColor(p) {
+  if (!p) return null;
+  return p === p.toUpperCase() ? 'w' : 'b';
+}
+function pieceType(p) { return p ? p.toLowerCase() : null; }
+function isEnemy(p, turn) { return p && pieceColor(p) !== turn; }
+function isFriend(p, turn) { return p && pieceColor(p) === turn; }
+
+function pseudoMoves(board, from, turn, enPassant, castling) {
+  const p = board[from];
+  if (!p || pieceColor(p) !== turn) return [];
+  const type = pieceType(p);
+  const moves = [];
+  const rank = Math.floor(from / 8), file = from % 8;
+
+  const addIfValid = (to) => {
+    if (to < 0 || to > 63) return;
+    if (!isFriend(board[to], turn)) moves.push(to);
+  };
+
+  const slide = (drs) => {
+    for (const [dr, df] of drs) {
+      let r = rank + dr, f = file + df;
+      while (r >= 0 && r < 8 && f >= 0 && f < 8) {
+        const to = r * 8 + f;
+        if (isFriend(board[to], turn)) break;
+        moves.push(to);
+        if (board[to]) break;
+        r += dr; f += df;
+      }
+    }
+  };
+
+  if (type === 'r') slide([[1,0],[-1,0],[0,1],[0,-1]]);
+  else if (type === 'b') slide([[1,1],[1,-1],[-1,1],[-1,-1]]);
+  else if (type === 'q') slide([[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]]);
+  else if (type === 'n') {
+    for (const [dr,df] of [[2,1],[2,-1],[-2,1],[-2,-1],[1,2],[1,-2],[-1,2],[-1,-2]]) {
+      const r = rank + dr, f2 = file + df;
+      if (r >= 0 && r < 8 && f2 >= 0 && f2 < 8) addIfValid(r * 8 + f2);
+    }
+  }
+  else if (type === 'k') {
+    for (const [dr,df] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]]) {
+      const r = rank + dr, f2 = file + df;
+      if (r >= 0 && r < 8 && f2 >= 0 && f2 < 8) addIfValid(r * 8 + f2);
+    }
+    const backRank = turn === 'w' ? 0 : 7;
+    if (rank === backRank && file === 4) {
+      if (castling.includes(turn === 'w' ? 'K' : 'k') &&
+          !board[backRank*8+5] && !board[backRank*8+6] &&
+          board[backRank*8+7] === (turn === 'w' ? 'R' : 'r')) {
+        moves.push(from + 2);
+      }
+      if (castling.includes(turn === 'w' ? 'Q' : 'q') &&
+          !board[backRank*8+3] && !board[backRank*8+2] && !board[backRank*8+1] &&
+          board[backRank*8+0] === (turn === 'w' ? 'R' : 'r')) {
+        moves.push(from - 2);
+      }
+    }
+  }
+  else if (type === 'p') {
+    const dir = turn === 'w' ? 1 : -1;
+    const startRank = turn === 'w' ? 1 : 6;
+    const fwd = from + dir * 8;
+    if (fwd >= 0 && fwd < 64 && !board[fwd]) {
+      moves.push(fwd);
+      const fwd2 = from + dir * 16;
+      if (rank === startRank && !board[fwd2]) moves.push(fwd2);
+    }
+    for (const df of [-1, 1]) {
+      const f2 = file + df;
+      if (f2 < 0 || f2 > 7) continue;
+      const to = (rank + dir) * 8 + f2;
+      if (to >= 0 && to < 64) {
+        if (isEnemy(board[to], turn)) moves.push(to);
+        else if (enPassant !== null && to === enPassant) moves.push(to);
+      }
+    }
+  }
+  return moves;
+}
+
+function isSquareAttacked(board, sq, byColor) {
+  for (let i = 0; i < 64; i++) {
+    if (!board[i] || pieceColor(board[i]) !== byColor) continue;
+    const moves = pseudoMoves(board, i, byColor, null, '');
+    if (moves.includes(sq)) return true;
+  }
+  return false;
+}
+
+function findKing(board, color) {
+  const k = color === 'w' ? 'K' : 'k';
+  for (let i = 0; i < 64; i++) if (board[i] === k) return i;
+  return -1;
+}
+
+function isInCheck(board, color) {
+  const kSq = findKing(board, color);
+  if (kSq < 0) return false;
+  return isSquareAttacked(board, kSq, color === 'w' ? 'b' : 'w');
+}
+
+function applyMove(board, from, to, promotion, enPassant, castling) {
+  const b = board.slice();
+  const p = b[from];
+  const turn = pieceColor(p);
+  const type = pieceType(p);
+  const rank = Math.floor(from / 8), file = from % 8;
+  const toRank = Math.floor(to / 8), toFile = to % 8;
+  let newEP = null;
+  let newCastling = castling;
+
+  if (type === 'p' && enPassant !== null && to === enPassant) {
+    const dir = turn === 'w' ? 1 : -1;
+    b[to - dir * 8] = null;
+  }
+
+  if (type === 'p' && Math.abs(toRank - rank) === 2) {
+    const dir = turn === 'w' ? 1 : -1;
+    newEP = from + dir * 8;
+  }
+
+  if (type === 'k' && Math.abs(toFile - file) === 2) {
+    const backRank = turn === 'w' ? 0 : 7;
+    if (toFile === 6) {
+      b[backRank*8+5] = b[backRank*8+7];
+      b[backRank*8+7] = null;
+    } else {
+      b[backRank*8+3] = b[backRank*8+0];
+      b[backRank*8+0] = null;
+    }
+  }
+
+  if (type === 'k') newCastling = newCastling.replace(turn === 'w' ? 'K' : 'k', '').replace(turn === 'w' ? 'Q' : 'q', '');
+  if (type === 'r') {
+    if (from === 0) newCastling = newCastling.replace('Q', '');
+    if (from === 7) newCastling = newCastling.replace('K', '');
+    if (from === 56) newCastling = newCastling.replace('q', '');
+    if (from === 63) newCastling = newCastling.replace('k', '');
+  }
+  if (to === 0) newCastling = newCastling.replace('Q', '');
+  if (to === 7) newCastling = newCastling.replace('K', '');
+  if (to === 56) newCastling = newCastling.replace('q', '');
+  if (to === 63) newCastling = newCastling.replace('k', '');
+
+  b[to] = promotion ? (turn === 'w' ? promotion.toUpperCase() : promotion.toLowerCase()) : p;
+  b[from] = null;
+
+  return { board: b, newEP, newCastling };
+}
+
+function legalMoves(board, turn, enPassant, castling) {
+  const all = [];
+  for (let from = 0; from < 64; from++) {
+    if (!board[from] || pieceColor(board[from]) !== turn) continue;
+    const pMoves = pseudoMoves(board, from, turn, enPassant, castling);
+    for (const to of pMoves) {
+      const type = pieceType(board[from]);
+      const toRank = Math.floor(to / 8);
+      const file = from % 8; const toFile = to % 8;
+
+      if (type === 'k' && Math.abs(toFile - file) === 2) {
+        const backRank = turn === 'w' ? 0 : 7;
+        const kingPath = toFile === 6
+          ? [backRank*8+4, backRank*8+5, backRank*8+6]
+          : [backRank*8+4, backRank*8+3, backRank*8+2];
+        const enemy = turn === 'w' ? 'b' : 'w';
+        if (kingPath.some(sq => isSquareAttacked(board, sq, enemy))) continue;
+      }
+
+      const { board: nb } = applyMove(board, from, to, null, enPassant, castling);
+      if (!isInCheck(nb, turn)) {
+        if (type === 'p' && (toRank === 0 || toRank === 7)) {
+          for (const promo of ['q','r','b','n']) all.push({from, to, promo});
+        } else {
+          all.push({from, to, promo: null});
+        }
+      }
+    }
+  }
+  return all;
+}
+
 function send(ws, msg) {
   if (!ws || ws.readyState !== ws.OPEN) return;
   try { ws.send(JSON.stringify(msg)); } catch (_) { /* ignore */ }
@@ -58,6 +273,7 @@ function broadcastRoom(room, msg, exceptColor) {
 }
 
 function freshGameState(timeSec) {
+  const initial = parseFen(INIT_FEN);
   return {
     clockWhiteMs: timeSec ? timeSec * 1000 : 0,
     clockBlackMs: timeSec ? timeSec * 1000 : 0,
@@ -72,6 +288,11 @@ function freshGameState(timeSec) {
     rematchOffer: null,
     capturedByWhite: [],
     capturedByBlack: [],
+    // Server-authoritative position, used to validate legality of each
+    // incoming move independently of whatever the client claims.
+    board: initial.board,
+    enPassant: initial.enPassant,
+    castling: initial.castling,
   };
 }
 
@@ -400,9 +621,26 @@ function handleMove(ws, msg) {
     sendError(ws, 'NOT_YOUR_TURN', 'Not your turn.');
     return;
   }
-  if (typeof msg.from !== 'number' || typeof msg.to !== 'number') {
+  if (!Number.isInteger(msg.from) || !Number.isInteger(msg.to) ||
+      msg.from < 0 || msg.from > 63 || msg.to < 0 || msg.to > 63) {
     sendError(ws, 'BAD_MOVE', 'Invalid move payload.');
     return;
+  }
+
+  const promo = typeof msg.promo === 'string' ? msg.promo.toLowerCase() : null;
+  const legal = legalMoves(room.board, meta.color, room.enPassant, room.castling);
+  const matchedMove = legal.find(m => m.from === msg.from && m.to === msg.to && m.promo === promo);
+  if (!matchedMove) {
+    sendError(ws, 'ILLEGAL_MOVE', 'Move rejected: not legal in current position.');
+    return;
+  }
+
+  {
+    const { board: nextBoard, newEP, newCastling } =
+      applyMove(room.board, msg.from, msg.to, promo, room.enPassant, room.castling);
+    room.board = nextBoard;
+    room.enPassant = newEP;
+    room.castling = newCastling;
   }
 
   if (room.drawOfferFromColor) {
