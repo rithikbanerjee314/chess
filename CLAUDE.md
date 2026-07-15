@@ -86,7 +86,7 @@ Pure functions, all side-effect free except where noted. These live in the main 
 
 - **`parseFen(fen)`** — turns a FEN string into a game state. Used only to set up the initial position.
 - **`pseudoMoves(board, from, turn, enPassant, castling)`** — generates all moves a piece *could* make from `from`, ignoring whether the move leaves the king in check. Returns a **plain array of integer square indices** (not objects). Sliders for R/B/Q stop at blockers and at the first enemy piece. Handles castling (path empty in `board`, rook present) and pawn moves (forward needs empty square, diagonal needs enemy or EP target). **Pawn diagonal captures are only added when `isEnemy(board[to], turn)` is true** — this matters when using `pseudoMoves` to test pawn attack coverage.
-- **`isSquareAttacked(board, sq, byColor)`** — iterates all pieces of `byColor`, calls `pseudoMoves`, and returns `true` if any result includes `sq`. Uses `moves.includes(sq)` (integer comparison). Used for check detection and castling legality.
+- **`isSquareAttacked(board, sq, byColor)`** — reverse attack detection: scans outward from `sq` itself (pawn/knight/king fixed offsets plus 8 slider rays that stop at the first occupied square) instead of generating every `byColor` piece's moves. Roughly an order of magnitude faster than the old pseudoMoves-based version — this is the hottest function in the search (check detection + per-move legality filtering). Pawn semantics are correct chess: pawns attack diagonally only (the old version also counted a pawn's forward-push square as "attacked", which wrongly forbade castling in rare cases). The same implementation is duplicated in `server.js` for move-legality validation — keep the two in sync. Used for check detection and castling legality.
 - **`isInCheck(board, color)`**, **`findKing(board, color)`** — standard.
 - **`applyMove(board, from, to, promo, enPassant, castling)`** — returns `{board, newEP, newCastling}`. Does **not** mutate the input. Handles EP captures, castling rook movement, and updates castling rights when kings or rooks move or rooks are captured.
 - **`legalMoves(board, turn, ep, castling)`** — full legality: filters out moves leaving the king in check, expands pawn-to-last-rank into four promotion options, blocks castling through attacked squares.
@@ -156,8 +156,10 @@ The search lives in the worker, not the main thread. The main thread's negamax/q
 ### Search architecture
 
 - **`negamax(board, turn, ep, castling, depth, alpha, beta, ply, allowNull)`** — fail-soft negamax with the full enhancement stack below. Scores are from the side-to-move's perspective.
-- **`quiesce(board, turn, ep, castling, alpha, beta, qdepth)`** — capture-only search (`QMAX = 6` plies). Includes delta pruning: if even capturing the most valuable target plus a 200-cp margin can't reach alpha, the capture is skipped.
-- **`computerMove(gameState)`** — iterative deepening from depth 1 to `MAX_DEPTH` with a wall-clock budget. Aspiration windows around the previous iteration's score (±50 cp). Best move from the deepest *fully completed* iteration is returned; a partial deeper iteration is discarded. Budget and depth vary by difficulty — see DIFFICULTY object below.
+- **`quiesce(board, turn, ep, castling, alpha, beta, qdepth, ply)`** — captures + promotions when quiet (`QMAX = 6` plies); **all evasions when in check** (standing pat while in check isn't legal, so in-check nodes search every legal move; check sequences stay finite because the checking side can only continue with captures; no legal evasions = mate score). Stand-pat uses `evaluateBoardLazy`. Delta pruning (200-cp margin) and **SEE pruning** (`seeCapture < 0` captures skipped, promotions always searched).
+- **`seeCapture(board, from, to, ep)` / `leastValuableAttacker(board, sq, byColor)`** — static exchange evaluation via the standard swap algorithm: alternate cheapest-attacker recaptures on a scratch board, then negamax the gain list. X-rays emerge naturally from removing each attacker before rescanning. Promotions mid-exchange ignored.
+- **`fastEval(board, turn)` / `evaluateBoardLazy(board, turn, alpha, beta)`** — lazy evaluation. `fastEval` is material + PST + tempo only (single O(64) pass, no pseudoMoves). `evaluateBoardLazy` returns the **side-to-move POV** score: the fast estimate directly when it's ≥ `LAZY_MARGIN` (380 cp) outside (alpha, beta), the full `evaluateBoard` otherwise. Used for quiesce stand-pat and negamax's shared static eval; skips the expensive mobility/king-safety/threats/pawn-structure terms at the large majority of q-nodes.
+- **`computerMove(gameState)`** — iterative deepening from depth 1 to `MAX_DEPTH` with a wall-clock budget. Aspiration windows around the previous iteration's score (±50 cp). Best move from the deepest *fully completed* iteration is returned; a partial deeper iteration is discarded. Budget and depth vary by difficulty — see DIFFICULTY object below. Optional `gameState` extras: `prevKeys` (array of `positionHash` values for every position reached in the game — the search scores any return to one of them as a repetition draw) and `softMs` (don't *start* a new iteration past this point; the hard `searchMs` deadline still aborts mid-iteration). **The TT persists across moves of the same game** (killers reset per move, history halves) — it's only cleared by worker restart (new game) or `searchEval`.
 - **`searchEval(board, turn, ep, castling)`** — analysis-mode wrapper: iterative deepening to depth 10, 1500 ms budget. Used by the eval bar and move commentary system.
 
 ### DIFFICULTY object
@@ -176,8 +178,11 @@ Per-difficulty search parameters live in the `DIFFICULTY` object:
 
 | Enhancement | Where | Notes |
 |---|---|---|
-| Transposition table | `positionHash`, `ttProbe`, `ttStore`, `ttClear` | FNV-1a 32-bit hash of (board, turn, castling, ep). 256k entries (`TT_SIZE = 1 << 18`). Three bound types: `TT_EXACT`, `TT_LOWER`, `TT_UPPER`. Always-replace-by-depth. ~80–150 Elo. |
-| Null-move pruning | inside `negamax` | Skips our turn at reduced depth (R=2 at depth ≥ 3, R=3 at depth ≥ 6). Disabled in check and when the side-to-move has only K + pawns (`hasNonPawnMaterial`). ~50–80 Elo. |
+| Transposition table | `positionHash`, `ttProbe`, `ttStore`, `ttClear` | FNV-1a 32-bit hash of (board, turn, castling, ep). 256k entries (`TT_SIZE = 1 << 18`). Three bound types: `TT_EXACT`, `TT_LOWER`, `TT_UPPER`. Always-replace-by-depth. Persists across moves of the same game. ~80–150 Elo. |
+| Repetition detection | top of `negamax` (`_prevKeys`, `_pathKeys`) | Any position whose hash is already on the current search path (`_pathKeys` stack, unwound via `finally`) or in the played game (`_prevKeys`, from `gameState.prevKeys`) scores 0 at ply > 0. Checked before the TT probe so a cached score can't mask a threefold. |
+| Null-move pruning | inside `negamax` | Skips our turn at reduced depth (R=2 at depth ≥ 3, R=3 at depth ≥ 6). Disabled in check, when the side-to-move has only K + pawns (`hasNonPawnMaterial`), and when `staticEval < beta` (eval guard — the null search would almost never fail high). ~50–80 Elo. |
+| SEE pruning (qsearch) | `seeCapture` inside `quiesce` | Captures whose swap-off ends negative are skipped entirely instead of searched. ~30 Elo. |
+| Lazy evaluation | `evaluateBoardLazy` | Material+PST-only eval returned directly when ≥ 380 cp outside the window; full eval (mobility, king safety, …) only near the window. Large NPS gain. |
 | Reverse futility pruning | inside `negamax` | At depth ≤ 4 and not in check: if `staticEval − 120*depth ≥ beta`, return `staticEval` immediately (the position is so good we don't need to search further). ~30–50 Elo. |
 | Futility pruning | inside `negamax` move loop | At depth 1–2, quiet moves are skipped when `staticEval + margin ≤ alpha` (margin = 300 cp at depth 1, 500 cp at depth 2). Only applied after the first move and when not in check. ~20–30 Elo. |
 | Check extension | top of `negamax` | If side-to-move is in check, `depth += 1` before the depth-0 short-circuit. ~20–30 Elo. |
@@ -189,23 +194,21 @@ Per-difficulty search parameters live in the `DIFFICULTY` object:
 | History heuristic | `_history[piece * 64 + to]` | Quiet β-cutoff moves get `+depth²` to their history bucket. Used as a tiebreaker after killers. |
 | MVV-LVA + promotions | `moveOrderScoreEx` | Captures first (most-valuable-victim / least-valuable-attacker), then promotions, then quiet ordering. TT move always first (score 1e9). |
 
-### RFP and Futility implementation details
+### RFP, Futility, and NMP-guard implementation details
 
-Both pruning techniques share a single static eval computation gated on `depth <= 4` and `!inCheck`:
+All three share a single lazy static eval computed once per node when not in check (any depth — the null-move guard needs it at depth ≥ 3 too):
 
 ```js
-let rfpStaticEval = null;
-if (!inCheck && depth <= 4) {
-  const _ev = evaluateBoard(board, turn);
-  rfpStaticEval = turn === 'w' ? _ev : -_ev;
+let staticEval = null;
+if (!inCheck) staticEval = evaluateBoardLazy(board, turn, alpha, beta); // STM POV
+// Reverse Futility Pruning (depth <= 4)
+if (staticEval !== null && depth <= 4 && Math.abs(beta) < MATE_SCORE - 100) {
+  if (staticEval - 120 * depth >= beta) return staticEval;
 }
-// Reverse Futility Pruning
-if (rfpStaticEval !== null && Math.abs(beta) < MATE_SCORE - 100) {
-  if (rfpStaticEval - 120 * depth >= beta) return rfpStaticEval;
-}
+// Null-move pruning gains an eval guard: `staticEval >= beta` required.
 // ...
 // Futility pruning setup (before move loop)
-const fpEval = (depth <= 2 && rfpStaticEval !== null) ? rfpStaticEval : -Infinity;
+const fpEval = (depth <= 2 && staticEval !== null) ? staticEval : -Infinity;
 // ...
 // Inside move loop, after isQuiet computed, before applyMove:
 if (fpEval !== -Infinity && isQuiet && moveIdx > 0) {
@@ -213,6 +216,8 @@ if (fpEval !== -Infinity && isQuiet && moveIdx > 0) {
   if (fpEval + fpMargin <= alpha) continue;
 }
 ```
+
+`negamax`'s body (from the `_pathKeys.push(hash)` after the repetition check to the final `ttStore`) is wrapped in `try { … } finally { _pathKeys.pop(); }` so the path stack stays consistent on every return path, including the `'timeout'` throw.
 
 ### Eval-bar score comes from the search
 
@@ -247,6 +252,8 @@ function _makeEngineWorker() {
     let _nodeCount = 0;
     let lastSearchScore = 0;
     let lastSearchDepth = 0;
+    let _prevKeys = new Set();
+    let _pathKeys = [];
   `;
 
   // Stringify all engine functions that the search needs.
@@ -257,6 +264,7 @@ function _makeEngineWorker() {
     gamePhase, taper, mirrorSq, getPST,
     evalRooksMGEG, evalKnightOutpostsMGEG, evalThreatsMGEG, evalSpaceMG, kingZoneSafety,
     phase128, scaleFactor, pawnStructureMGEG, mobilityMGEG, evaluateMGEG, evaluateBoard,
+    fastEval, evaluateBoardLazy, leastValuableAttacker, seeCapture,
     positionHash, historyIdx,
     moveOrderScoreEx, orderMovesEx,
     quiesce, negamax, hasNonPawnMaterial,
@@ -809,8 +817,9 @@ The full project goal (multi-client server, LLM eval bar) is not yet started —
 
 ### Engine — remaining improvements
 
-- **Zobrist hashing** — the current TT uses an FNV-1a hash of the FEN-like string. It works fine at our search scale but isn't incrementally updatable. Switching to Zobrist keys (XOR'd into a single 64-bit number on each move) would make `positionHash` essentially free and unlock TT-based repetition detection inside the search.
-- **Static-exchange evaluation (SEE)** — quiescence currently uses crude delta pruning; SEE would let us skip losing captures entirely (~30 Elo).
+- **Zobrist hashing** — the current TT uses an FNV-1a hash of the FEN-like string. It works fine at our search scale but isn't incrementally updatable. Switching to Zobrist keys (XOR'd into a single 64-bit number on each move) would make `positionHash` essentially free (it's now also computed per node for repetition detection).
+- ✓ **Static-exchange evaluation (SEE)** — done. `seeCapture` prunes losing captures in quiescence and is available for move ordering.
+- **Incremental / make-unmake board** — `applyMove` copies the 64-element board array at every node. A make/unmake scheme (or typed-array board) is the next big NPS lever after the isSquareAttacked and lazy-eval rewrites.
 - **Better king-safety zone** — Stockfish's attack-units use per-piece attack-zone weights (different for N/B/R/Q) and a quadratic combined-attacker scaling. We approximate it; a fuller implementation would help.
 - **Tapered piece-bonus tables for threats** — current threat bonuses are single-pair constants per victim type. Real Stockfish has richer tables.
 
@@ -829,6 +838,8 @@ The full project goal (multi-client server, LLM eval bar) is not yet started —
 - LLM-based natural-language game analysis panel.
 
 ## Recent Fixes Worth Knowing
+
+- **Search engine substantially strengthened (July 2026)** — motivated by UCI gauntlet testing (see the separate `chess-bot-uci` repo) that showed the engine reaching only median depth 3 at blitz vs Stockfish's 14. Changes: (1) `isSquareAttacked` rewritten as reverse attack detection (~10x faster; also fixes pawn forward-push squares wrongly counting as attacked for castling-path checks — same fix ported to `server.js`); (2) lazy evaluation (`fastEval` + `evaluateBoardLazy`) — material+PST-only when ≥380 cp outside the window; (3) quiescence searches all evasions when in check (stand-pat in check was unsound) and prunes SEE-negative captures (`seeCapture`/`leastValuableAttacker`); (4) repetition detection in search (`_prevKeys` game hashes + `_pathKeys` path stack, draw score at ply>0, checked before TT); (5) TT persists across moves of a game (killers reset, history halves; cleared on worker restart/new game); (6) null-move pruning gains a `staticEval >= beta` guard; (7) `MAX_PLY` 64→128 with a killers-table guard; (8) `computerMove` accepts `prevKeys` and `softMs` (soft iteration-start deadline); `triggerComputerMove` passes game-history hashes. Browser CPU behavior otherwise unchanged (same difficulty budgets).
 
 - **Hard mode engine significantly strengthened** — `maxDepth` raised from 10 to 14, `searchMs` from 2200 to 4500. Quiescence depth (`QMAX`) raised from 4 to 6. Added Reverse Futility Pruning (RFP: static eval − 120×depth ≥ beta → prune) and Futility Pruning (at depth 1–2, skip quiet moves where static eval + margin ≤ alpha). Both pruning techniques allow more effective use of the larger budget by cutting branches that cannot improve the result. Analysis eval bar search (`searchEval`) also upgraded: budget 600 ms → 1500 ms, depth cap 6 → 10.
 - **Castle sound effect added** — `playSound('castle')` synthesizes two low-pass filtered noise bursts 140 ms apart (king slides into position, rook follows). Sound priority in `executeMove`: `checkmate → check → castle → promotion → capture → move`. `isCastleMove` is detected before `applyMove` while `G.board[from]` is still the king (`pieceType === 'k' && |to%8 − from%8| === 2`). Fires in all contexts: live CPU, live human-vs-human, and analysis navigation.

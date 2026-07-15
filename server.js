@@ -154,11 +154,52 @@ function pseudoMoves(board, from, turn, enPassant, castling) {
 }
 
 function isSquareAttacked(board, sq, byColor) {
-  for (let i = 0; i < 64; i++) {
-    if (!board[i] || pieceColor(board[i]) !== byColor) continue;
-    const moves = pseudoMoves(board, i, byColor, null, '');
-    if (moves.includes(sq)) return true;
+  // Reverse attack detection, kept in sync with chess.html: scan outward
+  // from `sq` instead of generating every byColor piece's moves. Also fixes
+  // the old version counting a pawn's forward-push square as "attacked"
+  // (pawns only attack diagonally), which mattered for castling-path checks.
+  const rank = Math.floor(sq/8), file = sq%8;
+
+  const pr = rank + (byColor === 'w' ? -1 : 1);
+  if (pr >= 0 && pr < 8) {
+    const pw = byColor === 'w' ? 'P' : 'p';
+    if (file > 0 && board[pr*8+file-1] === pw) return true;
+    if (file < 7 && board[pr*8+file+1] === pw) return true;
   }
+
+  const kn = byColor === 'w' ? 'N' : 'n';
+  for (const [dr,df] of [[2,1],[2,-1],[-2,1],[-2,-1],[1,2],[1,-2],[-1,2],[-1,-2]]) {
+    const r = rank+dr, f = file+df;
+    if (r>=0&&r<8&&f>=0&&f<8 && board[r*8+f] === kn) return true;
+  }
+
+  const kg = byColor === 'w' ? 'K' : 'k';
+  for (const [dr,df] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]]) {
+    const r = rank+dr, f = file+df;
+    if (r>=0&&r<8&&f>=0&&f<8 && board[r*8+f] === kg) return true;
+  }
+
+  const rk = byColor === 'w' ? 'R' : 'r';
+  const qn = byColor === 'w' ? 'Q' : 'q';
+  for (const [dr,df] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+    let r = rank+dr, f = file+df;
+    while (r>=0&&r<8&&f>=0&&f<8) {
+      const p = board[r*8+f];
+      if (p) { if (p === rk || p === qn) return true; break; }
+      r+=dr; f+=df;
+    }
+  }
+
+  const bp = byColor === 'w' ? 'B' : 'b';
+  for (const [dr,df] of [[1,1],[1,-1],[-1,1],[-1,-1]]) {
+    let r = rank+dr, f = file+df;
+    while (r>=0&&r<8&&f>=0&&f<8) {
+      const p = board[r*8+f];
+      if (p) { if (p === bp || p === qn) return true; break; }
+      r+=dr; f+=df;
+    }
+  }
+
   return false;
 }
 
